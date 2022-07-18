@@ -154,8 +154,8 @@ type DB interface {
 	GetGroup() string                   // See Core.GetGroup.
 	SetDryRun(enabled bool)             // See Core.SetDryRun.
 	GetDryRun() bool                    // See Core.GetDryRun.
-	SetLogger(logger *glog.Logger)      // See Core.SetLogger.
-	GetLogger() *glog.Logger            // See Core.GetLogger.
+	SetLogger(logger glog.ILogger)      // See Core.SetLogger.
+	GetLogger() glog.ILogger            // See Core.GetLogger.
 	GetConfig() *ConfigNode             // See Core.GetConfig.
 	SetMaxIdleConnCount(n int)          // See Core.SetMaxIdleConnCount.
 	SetMaxOpenConnCount(n int)          // See Core.SetMaxOpenConnCount.
@@ -165,13 +165,14 @@ type DB interface {
 	// Utility methods.
 	// ===========================================================================
 
-	GetCtx() context.Context                                                                         // See Core.GetCtx.
-	GetCore() *Core                                                                                  // See Core.GetCore
-	GetChars() (charLeft string, charRight string)                                                   // See Core.GetChars.
-	Tables(ctx context.Context, schema ...string) (tables []string, err error)                       // See Core.Tables.
-	TableFields(ctx context.Context, table string, schema ...string) (map[string]*TableField, error) // See Core.TableFields.
-	ConvertDataForRecord(ctx context.Context, data interface{}) (map[string]interface{}, error)      // See Core.ConvertDataForRecord
-	FilteredLink() string                                                                            // FilteredLink is used for filtering sensitive information in `Link` configuration before output it to tracing server.
+	GetCtx() context.Context                                                                                 // See Core.GetCtx.
+	GetCore() *Core                                                                                          // See Core.GetCore
+	GetChars() (charLeft string, charRight string)                                                           // See Core.GetChars.
+	Tables(ctx context.Context, schema ...string) (tables []string, err error)                               // See Core.Tables.
+	TableFields(ctx context.Context, table string, schema ...string) (map[string]*TableField, error)         // See Core.TableFields.
+	ConvertDataForRecord(ctx context.Context, data interface{}) (map[string]interface{}, error)              // See Core.ConvertDataForRecord
+	ConvertValueForLocal(ctx context.Context, fieldType string, fieldValue interface{}) (interface{}, error) // See Core.ConvertValueForLocal
+	FilteredLink() string                                                                                    // FilteredLink is used for filtering sensitive information in `Link` configuration before output it to tracing server.
 }
 
 // Core is the base struct for database management.
@@ -183,7 +184,7 @@ type Core struct {
 	debug  *gtype.Bool     // Enable debug mode for the database, which can be changed in runtime.
 	cache  *gcache.Cache   // Cache manager, SQL result cache only.
 	links  *gmap.StrAnyMap // links caches all created links by node.
-	logger *glog.Logger    // Logger for logging functionality.
+	logger glog.ILogger    // Logger for logging functionality.
 	config *ConfigNode     // Current config node.
 }
 
@@ -373,16 +374,14 @@ func NewByGroup(group ...string) (db DB, err error) {
 		var node *ConfigNode
 		if node, err = getConfigNodeByGroup(groupName, true); err == nil {
 			return doNewByNode(*node, groupName)
-		} else {
-			return nil, err
 		}
-	} else {
-		return nil, gerror.NewCodef(
-			gcode.CodeInvalidConfiguration,
-			`database configuration node "%s" is not found, did you misspell group name "%s" or miss the database configuration?`,
-			groupName, groupName,
-		)
+		return nil, err
 	}
+	return nil, gerror.NewCodef(
+		gcode.CodeInvalidConfiguration,
+		`database configuration node "%s" is not found, did you misspell group name "%s" or miss the database configuration?`,
+		groupName, groupName,
+	)
 }
 
 // doNewByNode creates and returns an ORM object with given configuration node and group name.
@@ -458,13 +457,12 @@ func getConfigNodeByGroup(group string, master bool) (*ConfigNode, error) {
 		} else {
 			return getConfigNodeByWeight(slaveList), nil
 		}
-	} else {
-		return nil, gerror.NewCodef(
-			gcode.CodeInvalidConfiguration,
-			"empty database configuration for item name '%s'",
-			group,
-		)
 	}
+	return nil, gerror.NewCodef(
+		gcode.CodeInvalidConfiguration,
+		"empty database configuration for item name '%s'",
+		group,
+	)
 }
 
 // getConfigNodeByWeight calculates the configuration weights and randomly returns a node.
@@ -497,12 +495,13 @@ func getConfigNodeByWeight(cg ConfigGroup) *ConfigNode {
 	)
 	for i := 0; i < len(cg); i++ {
 		max = min + cg[i].Weight*100
-		// fmt.Printf("r: %d, min: %d, max: %d\n", r, min, max)
 		if random >= min && random < max {
-			return &cg[i]
-		} else {
-			min = max
+			// Return a copy of the ConfigNode.
+			node := ConfigNode{}
+			node = cg[i]
+			return &node
 		}
+		min = max
 	}
 	return nil
 }
@@ -517,6 +516,8 @@ func (c *Core) getSqlDb(master bool, schema ...string) (sqlDb *sql.DB, err error
 	)
 	// Load balance.
 	if c.group != "" {
+		configs.RLock()
+		defer configs.RUnlock()
 		node, err = getConfigNodeByGroup(c.group, master)
 		if err != nil {
 			return nil, err
